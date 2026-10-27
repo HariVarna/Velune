@@ -407,6 +407,7 @@ class MusicService :
     private var togetherClient: com.nikhil.yt.together.TogetherClient? = null
     private var togetherBroadcastJob: Job? = null
     private var togetherOnlineConnectJob: Job? = null
+    private var togetherHostEventsJob: Job? = null
     private var togetherClientEventsJob: Job? = null
     private var togetherHeartbeatJob: Job? = null
     private var togetherClock: com.nikhil.yt.together.TogetherClock? = null
@@ -2024,11 +2025,7 @@ class MusicService :
                     initialSettings = settings,
                 )
 
-            server.onEvent = { event ->
-                ioScope.launch(SilentHandler) {
-                    handleTogetherHostEvent(event) { server.currentSettings() }
-                }
-            }
+            server.onEvent = startTogetherHostEventLoop { server.currentSettings() }
 
             server.start(port)
             togetherServer = server
@@ -2069,13 +2066,38 @@ class MusicService :
         }
     }
 
-    private fun togetherOnlineErrorMessage(t: Throwable): String {
+    private fun startTogetherHostEventLoop(
+        currentSettings: suspend () -> com.nikhil.yt.together.TogetherRoomSettings,
+    ): (com.nikhil.yt.together.TogetherServerEvent) -> Unit {
+        togetherHostEventsJob?.cancel()
+        val channel =
+            kotlinx.coroutines.channels.Channel<com.nikhil.yt.together.TogetherServerEvent>(
+                kotlinx.coroutines.channels.Channel.UNLIMITED,
+            )
+        togetherHostEventsJob =
+            ioScope.launch(SilentHandler) {
+                for (event in channel) {
+                    handleTogetherHostEvent(event, currentSettings)
+                }
+            }
+        return { event -> channel.trySend(event) }
+    }
+
+    private fun togetherOnlineErrorMessage(t: Throwable, isCreating: Boolean = false): String {
         if (t is com.nikhil.yt.together.TogetherOnlineApiException) {
             val code = t.statusCode
             return when {
-                code == 404 -> getString(R.string.together_session_not_found)
+                code == 401 || code == 403 -> "Authentication failed: server token rejected"
+                code == 404 -> {
+                    if (isCreating) {
+                        "Online backend service not found (404). Check server deployment or URL"
+                    } else {
+                        getString(R.string.together_session_not_found)
+                    }
+                }
+                code == 429 -> "Too many requests. Please wait and try again."
                 code != null && code in 500..599 -> getString(R.string.together_server_error)
-                else -> t.message ?: getString(R.string.network_unavailable)
+                else -> t.message?.takeIf { it.isNotBlank() } ?: getString(R.string.network_unavailable)
             }
         }
         val root = generateSequence(t) { it.cause }.lastOrNull() ?: t
@@ -2083,8 +2105,9 @@ class MusicService :
             is UnknownHostException -> getString(R.string.together_server_unreachable)
             is ConnectException -> getString(R.string.together_server_unreachable)
             is SocketTimeoutException -> getString(R.string.together_connection_timed_out)
-            is javax.net.ssl.SSLHandshakeException -> getString(R.string.together_server_unreachable)
-            else -> getString(R.string.network_unavailable)
+            is javax.net.ssl.SSLHandshakeException -> "Secure connection failed (SSL/TLS error)"
+            else -> root.message?.takeIf { it.isNotBlank() && !it.contains("token", ignoreCase = true) && !it.contains("key", ignoreCase = true) }
+                ?: getString(R.string.network_unavailable)
         }
     }
 
@@ -2093,8 +2116,20 @@ class MusicService :
         settings: com.nikhil.yt.together.TogetherRoomSettings,
     ) {
         ensureScopesActive()
+        val current = togetherSessionState.value
+        if (current is com.nikhil.yt.together.TogetherSessionState.HostingOnline && current.roomState == null) {
+            Timber.tag("Together").w("Host session creation already in progress")
+            return
+        }
+
         scope.launch(SilentHandler) {
-            togetherSessionState.value = com.nikhil.yt.together.TogetherSessionState.Idle
+            togetherSessionState.value =
+                com.nikhil.yt.together.TogetherSessionState.HostingOnline(
+                    sessionId = "",
+                    code = "...",
+                    settings = settings,
+                    roomState = null,
+                )
         }
 
         ioScope.launch(SilentHandler) {
@@ -2113,8 +2148,21 @@ class MusicService :
                 return@launch
             }
 
-            val togetherToken = "VeluneAdminToken"
-            if (togetherToken == null) {
+            if (baseUrl.startsWith("http://", ignoreCase = true) && !com.nikhil.yt.together.TogetherOnlineEndpoint.isLocalOrLoopback(baseUrl)) {
+                scope.launch(SilentHandler) {
+                    togetherSessionState.value =
+                        com.nikhil.yt.together.TogetherSessionState.Error(
+                            message = "Secure connection required: remote endpoints must use HTTPS",
+                            recoverable = true,
+                        )
+                }
+                return@launch
+            }
+
+            val togetherToken = com.nikhil.yt.BuildConfig.TOGETHER_BEARER_TOKEN.trim().takeIf { it.isNotBlank() }
+                ?: "VeluneAdminToken"
+
+            if (togetherToken.isBlank()) {
                 scope.launch(SilentHandler) {
                     togetherSessionState.value =
                         com.nikhil.yt.together.TogetherSessionState.Error(
@@ -2138,11 +2186,12 @@ class MusicService :
                     scope.launch(SilentHandler) {
                         togetherSessionState.value =
                             com.nikhil.yt.together.TogetherSessionState.Error(
-                                message = togetherOnlineErrorMessage(t),
+                                message = togetherOnlineErrorMessage(t, isCreating = true),
                                 recoverable = true,
                             )
                     }
                     reportException(t)
+                    stopTogetherInternal()
                     return@launch
                 }
 
@@ -2158,12 +2207,7 @@ class MusicService :
                     bearerToken = togetherToken,
                 )
 
-            onlineHost.onEvent = { event ->
-                ioScope.launch(SilentHandler) {
-                    handleTogetherHostEvent(event) { onlineHost.currentSettings() }
-                }
-            }
-
+            onlineHost.onEvent = startTogetherHostEventLoop { onlineHost.currentSettings() }
             togetherOnlineHost = onlineHost
 
             scope.launch(SilentHandler) {
@@ -2208,20 +2252,22 @@ class MusicService :
                                 hostId = togetherHostId,
                             )
                         onlineHost.broadcastRoomState(state)
-                        scope.launch(SilentHandler) {
-                            val hosting =
-                                togetherSessionState.value as? com.nikhil.yt.together.TogetherSessionState.HostingOnline
-                            if (hosting?.sessionId == created.sessionId) {
-                                val currentSettings = onlineHost.currentSettings()
-                                togetherSessionState.value =
-                                    hosting.copy(
-                                        settings = currentSettings,
-                                        roomState =
-                                            state.copy(
-                                                participants = onlineHost.currentParticipants(),
-                                                settings = currentSettings,
-                                            ),
-                                    )
+                        if (onlineHost.isConnected) {
+                            scope.launch(SilentHandler) {
+                                val hosting =
+                                    togetherSessionState.value as? com.nikhil.yt.together.TogetherSessionState.HostingOnline
+                                if (hosting?.sessionId == created.sessionId) {
+                                    val currentSettings = onlineHost.currentSettings()
+                                    togetherSessionState.value =
+                                        hosting.copy(
+                                            settings = currentSettings,
+                                            roomState =
+                                                state.copy(
+                                                    participants = onlineHost.currentParticipants(),
+                                                    settings = currentSettings,
+                                                ),
+                                        )
+                                }
                             }
                         }
                         kotlinx.coroutines.delay(750)
@@ -2416,7 +2462,7 @@ class MusicService :
         displayName: String,
     ) {
         ensureScopesActive()
-        val trimmedCode = code.trim()
+        val trimmedCode = code.trim().uppercase()
         if (trimmedCode.isBlank()) {
             scope.launch(SilentHandler) {
                 togetherSessionState.value =
@@ -2425,6 +2471,12 @@ class MusicService :
                         recoverable = true,
                     )
             }
+            return
+        }
+
+        val current = togetherSessionState.value
+        if (current is com.nikhil.yt.together.TogetherSessionState.JoiningOnline && current.code == trimmedCode) {
+            Timber.tag("Together").w("Join attempt already in progress for code $trimmedCode")
             return
         }
 
@@ -2448,8 +2500,21 @@ class MusicService :
                 return@launch
             }
 
-            val togetherToken ="velune_server_token"
-            if (togetherToken == null) {
+            if (baseUrl.startsWith("http://", ignoreCase = true) && !com.nikhil.yt.together.TogetherOnlineEndpoint.isLocalOrLoopback(baseUrl)) {
+                scope.launch(SilentHandler) {
+                    togetherSessionState.value =
+                        com.nikhil.yt.together.TogetherSessionState.Error(
+                            message = "Secure connection required: remote endpoints must use HTTPS",
+                            recoverable = true,
+                        )
+                }
+                return@launch
+            }
+
+            val togetherToken = com.nikhil.yt.BuildConfig.TOGETHER_BEARER_TOKEN.trim().takeIf { it.isNotBlank() }
+                ?: "velune_server_token"
+
+            if (togetherToken.isBlank()) {
                 scope.launch(SilentHandler) {
                     togetherSessionState.value =
                         com.nikhil.yt.together.TogetherSessionState.Error(
@@ -2467,11 +2532,12 @@ class MusicService :
                         scope.launch(SilentHandler) {
                             togetherSessionState.value =
                                 com.nikhil.yt.together.TogetherSessionState.Error(
-                                    message = togetherOnlineErrorMessage(t),
+                                    message = togetherOnlineErrorMessage(t, isCreating = false),
                                     recoverable = true,
                                 )
                         }
                         reportException(t)
+                        stopTogetherInternal()
                         return@launch
                     }
 
@@ -3047,6 +3113,9 @@ class MusicService :
 
         togetherOnlineConnectJob?.cancel()
         togetherOnlineConnectJob = null
+
+        togetherHostEventsJob?.cancel()
+        togetherHostEventsJob = null
 
         togetherClientEventsJob?.cancel()
         togetherClientEventsJob = null

@@ -105,6 +105,10 @@ class TogetherOnlineApi(
     }
 
     private fun isRetryable(t: Throwable): Boolean {
+        if (t is TogetherOnlineApiException) {
+            val code = t.statusCode
+            if (code != null && code in 400..499) return false
+        }
         val root = generateSequence(t) { it.cause }.lastOrNull() ?: t
         return root is java.net.SocketTimeoutException ||
             root is java.net.ConnectException ||
@@ -115,6 +119,8 @@ class TogetherOnlineApi(
     private data class TogetherOnlineErrorResponse(
         val ok: Boolean? = null,
         val error: String? = null,
+        val message: String? = null,
+        val detail: String? = null,
         val code: String? = null,
     )
 
@@ -126,12 +132,14 @@ class TogetherOnlineApi(
             runCatching { json.decodeFromString(TogetherOnlineErrorResponse.serializer(), rawBody) }
                 .getOrNull()
         val specific = parsedError?.error?.trim()?.takeIf { it.isNotBlank() }
+            ?: parsedError?.message?.trim()?.takeIf { it.isNotBlank() }
+            ?: parsedError?.detail?.trim()?.takeIf { it.isNotBlank() }
         if (specific != null) return specific
         return when (status) {
             400 -> "Bad request"
-            401 -> "Unauthorized"
-            403 -> "Forbidden"
-            404 -> "Session not found"
+            401 -> "Authentication failed (Unauthorized)"
+            403 -> "Forbidden: access denied"
+            404 -> "Not found: session or endpoint does not exist"
             429 -> "Too many requests, please try again later"
             in 500..599 -> "Server error ($status)"
             else -> "Unexpected response ($status)"
@@ -174,7 +182,7 @@ class TogetherOnlineApi(
             val payload =
                 json.encodeToString(
                     TogetherOnlineResolveRequest.serializer(),
-                    TogetherOnlineResolveRequest(code = code.trim()),
+                    TogetherOnlineResolveRequest(code = code.trim().uppercase()),
                 )
             val resp =
                 client.post("$v1BaseUrl/together/sessions/resolve") {

@@ -19,6 +19,7 @@ import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import io.ktor.websocket.send
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -28,6 +29,7 @@ import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
+import timber.log.Timber
 
 @Immutable
 sealed class TogetherOnlineHostState {
@@ -81,15 +83,18 @@ class TogetherOnlineHost(
         val participantId: String,
         val clientId: String,
         val name: String,
-        var pending: Boolean,
+        val pending: Boolean,
     )
 
-    private val guests = LinkedHashMap<String, Guest>()
+    private val guests = ConcurrentHashMap<String, Guest>()
 
     @Volatile
     private var lastParticipants: List<TogetherParticipant> = emptyList()
 
     var onEvent: ((TogetherServerEvent) -> Unit)? = null
+
+    val isConnected: Boolean
+        get() = session != null
 
     suspend fun connect(wsUrl: String) {
         disconnect()
@@ -140,7 +145,7 @@ class TogetherOnlineHost(
         val trimmed = url.trim()
         return when {
             trimmed.startsWith("ws://") -> "wss://${trimmed.removePrefix("ws://")}"
-            trimmed.startsWith("wss://") -> "ws://${trimmed.removePrefix("wss://")}"
+            // Never downgrade wss:// to ws://: that would transmit session credentials in cleartext
             else -> null
         }
     }
@@ -149,17 +154,23 @@ class TogetherOnlineHost(
         val root = generateSequence(t) { it.cause }.lastOrNull()
         val raw = root?.message?.trim().orEmpty()
         val reason =
-            when (root) {
-                is java.net.UnknownHostException -> "Server not found"
-                is java.net.ConnectException -> "Connection refused"
-                is java.net.SocketTimeoutException -> "Connection timed out"
-                is javax.net.ssl.SSLHandshakeException -> "Secure connection failed"
-                is IllegalArgumentException ->
-                    if (raw.contains("ws", ignoreCase = true) && raw.contains("scheme", ignoreCase = true)) "Invalid server websocket URL" else null
+            when {
+                root is java.net.UnknownHostException -> "Server not found"
+                root is java.net.ConnectException -> "Connection refused"
+                root is java.net.SocketTimeoutException -> "Connection timed out"
+                root is javax.net.ssl.SSLHandshakeException -> "Secure connection failed"
+                raw.contains("401", ignoreCase = true) || raw.contains("403", ignoreCase = true) ->
+                    "Authentication failed: server token rejected"
+                raw.contains("404", ignoreCase = true) ->
+                    "WebSocket endpoint not found (404)"
+                raw.contains("101", ignoreCase = true) || raw.contains("handshake", ignoreCase = true) ->
+                    "WebSocket handshake failed"
+                root is IllegalArgumentException && (raw.contains("ws", ignoreCase = true) && raw.contains("scheme", ignoreCase = true)) ->
+                    "Invalid server websocket URL"
                 else -> null
             }
 
-        val detail = reason ?: raw.takeIf { it.isNotBlank() }
+        val detail = reason ?: raw.takeIf { it.isNotBlank() && !it.contains("token", ignoreCase = true) && !it.contains("key", ignoreCase = true) }
         return if (detail == null) "Connection failed" else "Connection failed: $detail"
     }
 
@@ -197,11 +208,13 @@ class TogetherOnlineHost(
                     ),
                 )
             }
-            guest.pending = false
+            guests.remove(participantId)
+            rebuildParticipantsSnapshot()
+            onEvent?.invoke(TogetherServerEvent.ParticipantLeft(participantId, "Not approved"))
             return
         }
 
-        guest.pending = false
+        guests[participantId] = guest.copy(pending = false)
         runCatching {
             session?.send(
                 TogetherJson.json.encodeToString(
@@ -313,7 +326,7 @@ class TogetherOnlineHost(
                         val message =
                             runCatching { TogetherJson.json.decodeFromString(TogetherMessage.serializer(), text) }
                                 .getOrElse {
-                                    onEvent?.invoke(TogetherServerEvent.Error("Failed to decode message", it))
+                                    Timber.tag("Together").w(it, "dropping undecodable message in online host")
                                     continue
                                 }
 
@@ -379,13 +392,15 @@ class TogetherOnlineHost(
                         }
                     }
                 } catch (t: Throwable) {
-                    onEvent?.invoke(TogetherServerEvent.Error("Connection loop failed", t))
+                    if (t !is kotlinx.coroutines.CancellationException) {
+                        Timber.tag("Together").w(t, "online host connection loop failed")
+                        onEvent?.invoke(TogetherServerEvent.Error(connectionFailureMessage(t), t))
+                    }
                 } finally {
                     hostParticipantId = null
                     guests.clear()
                     lastParticipants = emptyList()
                     runCatching { session.close(CloseReason(CloseReason.Codes.NORMAL, "Disconnected")) }
-                    onEvent?.invoke(TogetherServerEvent.Error("Disconnected", null))
                 }
             }
         loopJob?.join()
