@@ -385,7 +385,7 @@ class TogetherServer(
                 val message =
                     runCatching { TogetherJson.json.decodeFromString(TogetherMessage.serializer(), text) }
                         .getOrElse {
-                            onEvent?.invoke(TogetherServerEvent.Error("Failed to decode message", it))
+                            Timber.tag("Together").w(it, "dropping undecodable message from client $participantId")
                             continue
                         }
 

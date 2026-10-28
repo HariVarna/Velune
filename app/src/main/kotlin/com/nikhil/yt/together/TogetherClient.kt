@@ -312,6 +312,9 @@ class TogetherClient(
             throw e
         } catch (e: Exception) {
             Timber.tag("Together").w(e, "send failed")
+            runCatching { session.close(CloseReason(CloseReason.Codes.PROTOCOL_ERROR, "Send failed: ${e.message}")) }
+            _events.tryEmit(TogetherClientEvent.Error("Connection send failure: ${e.message}", e))
+            _state.value = TogetherClientState.Idle
         }
     }
 

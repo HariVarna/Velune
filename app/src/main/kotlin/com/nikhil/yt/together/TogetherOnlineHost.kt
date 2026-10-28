@@ -21,10 +21,12 @@ import io.ktor.websocket.send
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -75,6 +77,7 @@ class TogetherOnlineHost(
     private var session: WebSocketSession? = null
     private var loopJob: Job? = null
     private var hostParticipantId: String? = null
+    private val outgoing = Channel<TogetherMessage>(Channel.UNLIMITED)
 
     private val clientId = clientId.trim().ifBlank { UUID.randomUUID().toString() }.take(64)
     private val normalizedBearerToken: String? = bearerToken?.trim()?.takeIf { it.isNotBlank() }
@@ -130,7 +133,9 @@ class TogetherOnlineHost(
                             displayName = hostDisplayName.trim(),
                         )
                     send(TogetherJson.json.encodeToString(TogetherMessage.serializer(), hello))
+                    val sender = launch { sendQueued(this@webSocket) }
                     runLoop(this, candidate)
+                    sender.cancel()
                 }
                 return
             } catch (t: Throwable) {
@@ -183,6 +188,21 @@ class TogetherOnlineHost(
         hostParticipantId = null
         guests.clear()
         lastParticipants = emptyList()
+        while (outgoing.tryReceive().isSuccess) Unit
+    }
+
+    private suspend fun sendQueued(session: WebSocketSession) {
+        try {
+            for (message in outgoing) {
+                session.send(TogetherJson.json.encodeToString(TogetherMessage.serializer(), message))
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Timber.tag("Together").w(e, "online host send failed")
+            runCatching { session.close(CloseReason(CloseReason.Codes.PROTOCOL_ERROR, "Send failed: ${e.message}")) }
+            onEvent?.invoke(TogetherServerEvent.Error("Host connection send failure: ${e.message}", e))
+        }
     }
 
     fun currentParticipants(): List<TogetherParticipant> = lastParticipants
@@ -200,14 +220,9 @@ class TogetherOnlineHost(
         if (!guest.pending) return
 
         if (!approved) {
-            runCatching {
-                session?.send(
-                    TogetherJson.json.encodeToString(
-                        TogetherMessage.serializer(),
-                        JoinDecision(sessionId = sessionId, participantId = participantId, approved = false),
-                    ),
-                )
-            }
+            outgoing.trySend(
+                JoinDecision(sessionId = sessionId, participantId = participantId, approved = false),
+            )
             guests.remove(participantId)
             rebuildParticipantsSnapshot()
             onEvent?.invoke(TogetherServerEvent.ParticipantLeft(participantId, "Not approved"))
@@ -215,14 +230,9 @@ class TogetherOnlineHost(
         }
 
         guests[participantId] = guest.copy(pending = false)
-        runCatching {
-            session?.send(
-                TogetherJson.json.encodeToString(
-                    TogetherMessage.serializer(),
-                    JoinDecision(sessionId = sessionId, participantId = participantId, approved = true),
-                ),
-            )
-        }
+        outgoing.trySend(
+            JoinDecision(sessionId = sessionId, participantId = participantId, approved = true),
+        )
         onEvent?.invoke(
             TogetherServerEvent.ParticipantJoined(
                 TogetherParticipant(
@@ -239,26 +249,16 @@ class TogetherOnlineHost(
 
     suspend fun kickParticipant(participantId: String, reason: String?) {
         if (!guests.containsKey(participantId)) return
-        runCatching {
-            session?.send(
-                TogetherJson.json.encodeToString(
-                    TogetherMessage.serializer(),
-                    KickParticipant(sessionId = sessionId, participantId = participantId, reason = reason),
-                ),
-            )
-        }
+        outgoing.trySend(
+            KickParticipant(sessionId = sessionId, participantId = participantId, reason = reason),
+        )
     }
 
     suspend fun banParticipant(participantId: String, reason: String?) {
         if (!guests.containsKey(participantId)) return
-        runCatching {
-            session?.send(
-                TogetherJson.json.encodeToString(
-                    TogetherMessage.serializer(),
-                    BanParticipant(sessionId = sessionId, participantId = participantId, reason = reason),
-                ),
-            )
-        }
+        outgoing.trySend(
+            BanParticipant(sessionId = sessionId, participantId = participantId, reason = reason),
+        )
     }
 
     suspend fun broadcastRoomState(state: TogetherRoomState) {
@@ -271,14 +271,7 @@ class TogetherOnlineHost(
                 participants = lastParticipants,
             )
 
-        runCatching {
-            session?.send(
-                TogetherJson.json.encodeToString(
-                    TogetherMessage.serializer(),
-                    RoomStateMessage(roomState),
-                ),
-            )
-        }
+        outgoing.trySend(RoomStateMessage(roomState))
     }
 
     private fun rebuildParticipantsSnapshot() {

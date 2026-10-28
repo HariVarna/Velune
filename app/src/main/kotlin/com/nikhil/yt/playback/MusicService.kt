@@ -2989,12 +2989,14 @@ class MusicService :
                 val settings = currentSettings()
                 if (!settings.allowGuestsToControlPlayback) return
                 applyHostControl(event.request.action)
+                broadcastHostStateNow()
             }
 
             is com.nikhil.yt.together.TogetherServerEvent.AddTrackRequested -> {
                 val settings = currentSettings()
                 if (!settings.allowGuestsToAddTracks) return
                 applyHostAddTrack(event.request.track, event.request.mode)
+                broadcastHostStateNow()
             }
 
             is com.nikhil.yt.together.TogetherServerEvent.JoinRequested,
@@ -3170,16 +3172,17 @@ class MusicService :
         val sentAt = state.sentAtElapsedRealtimeMs
         if (sentAt > 0L && lastSentAt > 0L && sentAt <= lastSentAt) return
 
-        val offset = if (togetherIsOnlineSession) 0L else (togetherClock?.snapshot()?.estimatedOffsetMs ?: 0L)
-        val correctedSentAt = sentAt + offset
-        val estimatedOnlineLatency = if (togetherIsOnlineSession) 1200L else 0L
-        val delta = if (togetherIsOnlineSession) estimatedOnlineLatency else (now - correctedSentAt).coerceAtLeast(0L)
+        val delta = if (togetherIsOnlineSession) {
+            1200L
+        } else {
+            togetherClock?.estimateElapsedSince(hostSentAtMs = sentAt, guestNowElapsedMs = now) ?: 0L
+        }
         val targetPos =
             if (state.isPlaying) (state.positionMs + delta).coerceAtLeast(0L) else state.positionMs.coerceAtLeast(0L)
 
         withContext(Dispatchers.Main) {
             togetherApplyingRemote = true
-            togetherSuppressEchoUntilElapsedMs = android.os.SystemClock.elapsedRealtime() + 450L
+            togetherSuppressEchoUntilElapsedMs = android.os.SystemClock.elapsedRealtime() + 600L
             try {
                 val desiredItems = state.queue.map { it.toMediaMetadata().toMediaItem() }
                 val desiredIds = state.queue.map { it.id }
@@ -3229,7 +3232,8 @@ class MusicService :
                         if (player.playWhenReady != state.isPlaying) {
                             player.playWhenReady = state.isPlaying
                             val drift = kotlin.math.abs(player.currentPosition - targetPos)
-                            if (drift > 100) {
+                            val resumeThreshold = if (togetherIsOnlineSession) 3000L else 1500L
+                            if (drift > resumeThreshold) {
                                 player.seekTo(targetPos)
                                 player.prepare()
                             }
@@ -3237,7 +3241,7 @@ class MusicService :
                     } else {
                         val drift = kotlin.math.abs(player.currentPosition - targetPos)
                         val seekThreshold = if (togetherIsOnlineSession) 4000L else 2000L
-                        val threshold = if (state.isPlaying) seekThreshold else 200L
+                        val threshold = if (state.isPlaying) seekThreshold else 600L
                         
                         if (drift > threshold) {
                             player.seekTo(targetPos)
