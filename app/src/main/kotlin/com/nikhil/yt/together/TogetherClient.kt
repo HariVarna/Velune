@@ -18,8 +18,13 @@ import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import io.ktor.websocket.send
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLHandshakeException
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -27,6 +32,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -123,44 +129,50 @@ class TogetherClient(
         get() = session != null
 
     fun connect(joinInfo: TogetherJoinInfo, displayName: String) {
+        val validation = joinInfo.validate()
+        if (validation.isFailure) {
+            val err = validation.exceptionOrNull()
+            _events.tryEmit(TogetherClientEvent.Error("Invalid invitation: ${err?.message ?: "Check link"}", err))
+            _state.value = TogetherClientState.Idle
+            return
+        }
+
         connectJob?.cancel()
         connectJob = scope.launch {
             disconnect()
             _state.value = TogetherClientState.Connecting(joinInfo)
 
+            // LAN connections explicitly use unencrypted ws:// (local TogetherServer is cleartext CIO).
+            // Do NOT try wss fallback for LAN hosts, as it would cause misleading SSLHandshakeExceptions or double timeouts.
             val wsUrl = joinInfo.toWebSocketUrl()
-            val urls = listOfNotNull(wsUrl, alternateWebSocketSchemeOrNull(wsUrl)).distinct()
-
             val token = normalizedBearerToken
 
             var lastError: Throwable? = null
-            for (candidate in urls) {
-                try {
-                    client.webSocket(
-                        urlString = candidate,
-                        request = {
-                            if (token != null) header("Authorization", "Bearer $token")
-                        },
-                    ) {
-                        session = this
-                        val hello =
-                            ClientHello(
-                                protocolVersion = TogetherProtocolVersion,
-                                sessionId = joinInfo.sessionId,
-                                sessionKey = joinInfo.sessionKey,
-                                clientId = clientId,
-                                displayName = displayName.trim(),
-                            )
-                        send(TogetherJson.json.encodeToString(TogetherMessage.serializer(), hello))
-                        _state.value = TogetherClientState.Connected(joinInfo)
-                        val sender = launch { sendQueued(this@webSocket) }
-                        runLoop(this, joinInfo.sessionId)
-                        sender.cancel()
-                    }
-                    return@launch
-                } catch (t: Throwable) {
-                    lastError = t
+            try {
+                client.webSocket(
+                    urlString = wsUrl,
+                    request = {
+                        if (token != null) header("Authorization", "Bearer $token")
+                    },
+                ) {
+                    session = this
+                    val hello =
+                        ClientHello(
+                            protocolVersion = TogetherProtocolVersion,
+                            sessionId = joinInfo.sessionId,
+                            sessionKey = joinInfo.sessionKey,
+                            clientId = clientId,
+                            displayName = displayName.trim().ifBlank { "Guest" },
+                        )
+                    send(TogetherJson.json.encodeToString(TogetherMessage.serializer(), hello))
+                    _state.value = TogetherClientState.Connected(joinInfo)
+                    val sender = launch { sendQueued(this@webSocket) }
+                    runLoop(this, joinInfo.sessionId)
+                    sender.cancel()
                 }
+                return@launch
+            } catch (t: Throwable) {
+                lastError = t
             }
 
             _events.tryEmit(TogetherClientEvent.Error(connectionFailureMessage(lastError), lastError))
@@ -180,7 +192,6 @@ class TogetherClient(
             _state.value = TogetherClientState.ConnectingRemote(wsUrl = wsUrl, sessionId = sessionId)
 
             val urls = listOfNotNull(wsUrl.trim(), alternateWebSocketSchemeOrNull(wsUrl.trim())).distinct()
-
             val token = normalizedBearerToken
 
             var lastError: Throwable? = null
@@ -227,19 +238,25 @@ class TogetherClient(
         }
     }
 
-    private fun connectionFailureMessage(t: Throwable?): String {
+    fun connectionFailureMessage(t: Throwable?): String {
         val root = generateSequence(t) { it.cause }.lastOrNull()
         val raw = root?.message?.trim().orEmpty()
         val reason =
             when {
-                root is java.net.UnknownHostException -> "Server not found"
-                root is java.net.ConnectException -> "Connection refused"
-                root is java.net.SocketTimeoutException -> "Connection timed out"
-                root is javax.net.ssl.SSLHandshakeException -> "Secure connection failed"
+                root is UnknownHostException ->
+                    "Host not found (the host address could not be resolved)"
+                root is NoRouteToHostException || raw.contains("no route", ignoreCase = true) ->
+                    "Host unreachable: Ensure both devices are connected to the same Wi-Fi/LAN network (check router AP/client isolation or firewall)"
+                root is ConnectException ->
+                    "Connection refused: Host is reachable, but Listen Together is not running or the port is blocked"
+                root is SocketTimeoutException ->
+                    "Connection timed out: Host unreachable. Verify both devices are connected to the same Wi-Fi network and AP/client isolation is disabled"
+                root is SSLHandshakeException ->
+                    "Secure connection failed: SSL/TLS handshake error"
                 raw.contains("401", ignoreCase = true) || raw.contains("403", ignoreCase = true) ->
-                    "Authentication failed: server token rejected"
+                    "Authentication failed: Session token rejected by server"
                 raw.contains("404", ignoreCase = true) ->
-                    "WebSocket endpoint not found (404)"
+                    "Listen Together room endpoint not found on host (404)"
                 raw.contains("101", ignoreCase = true) || raw.contains("handshake", ignoreCase = true) ->
                     "WebSocket handshake failed"
                 root is IllegalArgumentException && (raw.contains("ws", ignoreCase = true) && raw.contains("scheme", ignoreCase = true)) ->
@@ -252,12 +269,17 @@ class TogetherClient(
     }
 
     suspend fun disconnect() {
-        connectJob?.cancel()
-        connectJob?.cancelAndJoin()
+        val callerJob = currentCoroutineContext()[Job]
+        if (connectJob !== callerJob) {
+            connectJob?.cancelAndJoin()
+        }
         connectJob = null
-        loopJob?.cancel()
-        loopJob?.cancelAndJoin()
+
+        if (loopJob !== callerJob) {
+            loopJob?.cancelAndJoin()
+        }
         loopJob = null
+
         runCatching { session?.close(CloseReason(CloseReason.Codes.NORMAL, "Disconnect")) }
         session = null
         selfParticipantId = null
@@ -336,7 +358,7 @@ class TogetherClient(
 
                             is KickParticipant -> {
                                 if (message.sessionId == sessionId && message.participantId == selfParticipantId) {
-                                    val detail = message.reason?.trim().orEmpty().ifBlank { "Kicked" }
+                                    val detail = message.reason?.trim().orEmpty().ifBlank { "Kicked by host" }
                                     _events.tryEmit(TogetherClientEvent.Error(detail, null))
                                     break
                                 }
@@ -344,7 +366,7 @@ class TogetherClient(
 
                             is BanParticipant -> {
                                 if (message.sessionId == sessionId && message.participantId == selfParticipantId) {
-                                    val detail = message.reason?.trim().orEmpty().ifBlank { "Banned" }
+                                    val detail = message.reason?.trim().orEmpty().ifBlank { "Banned by host" }
                                     _events.tryEmit(TogetherClientEvent.Error(detail, null))
                                     break
                                 }
@@ -362,7 +384,9 @@ class TogetherClient(
                             }
 
                             is ServerError -> {
-                                _events.tryEmit(TogetherClientEvent.ServerIssue(message = message.message, code = message.code))
+                                if (message.sessionId == sessionId || message.sessionId.isBlank()) {
+                                    _events.tryEmit(TogetherClientEvent.ServerIssue(message = message.message, code = message.code))
+                                }
                             }
 
                             else -> Unit

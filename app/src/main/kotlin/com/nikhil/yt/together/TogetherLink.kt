@@ -17,39 +17,120 @@ data class TogetherJoinInfo(
     val sessionId: String,
     val sessionKey: String,
 ) {
-    fun toWebSocketUrl(): String =
-        "ws://$host:$port/together"
+    fun toWebSocketUrl(): String {
+        val cleanHost = host.trim()
+        val formattedHost = if (cleanHost.contains(":") && !cleanHost.startsWith("[")) {
+            "[$cleanHost]"
+        } else {
+            cleanHost
+        }
+        return "ws://$formattedHost:$port/together"
+    }
 
     fun toDeepLink(): String {
         val charset = StandardCharsets.UTF_8.name()
         val q =
             listOf(
-                "host" to host,
+                "host" to host.trim(),
                 "port" to port.toString(),
-                "sid" to sessionId,
-                "key" to sessionKey,
+                "sid" to sessionId.trim(),
+                "key" to sessionKey.trim(),
             ).joinToString("&") { (k, v) ->
                 "${URLEncoder.encode(k, charset)}=${URLEncoder.encode(v, charset)}"
             }
         return "velune://together?$q"
     }
+
+    fun validate(): Result<TogetherJoinInfo> {
+        val cleanHost = host.trim()
+        if (cleanHost.isBlank()) {
+            return Result.failure(IllegalArgumentException("Host address is blank"))
+        }
+        if (!TogetherLink.isValidHostAddress(cleanHost)) {
+            return Result.failure(IllegalArgumentException("Invalid host address: '$cleanHost'"))
+        }
+        if (port !in 1..65535) {
+            return Result.failure(IllegalArgumentException("Port $port is out of valid range (1..65535)"))
+        }
+        if (sessionId.isBlank()) {
+            return Result.failure(IllegalArgumentException("Session ID is blank"))
+        }
+        if (sessionKey.isBlank()) {
+            return Result.failure(IllegalArgumentException("Session key is blank"))
+        }
+        return Result.success(this)
+    }
 }
 
 object TogetherLink {
+    private val DEEP_LINK_REGEX = Regex("""velune://together\?[^\s"']+""", RegexOption.IGNORE_CASE)
+    private val WS_URL_REGEX = Regex("""(ws|wss|http|https)://[^\s"']+""", RegexOption.IGNORE_CASE)
+    private val IPV4_REGEX = Regex("""^((25[0-5]|(2[0-4]|1\d|[1-9]|)\d)\.?\b){4}$""")
+
     fun encode(joinInfo: TogetherJoinInfo): String = joinInfo.toDeepLink()
 
-    fun decode(raw: String): TogetherJoinInfo? {
-        val trimmed = raw.trim()
-        if (trimmed.isBlank()) return null
+    fun decode(raw: String): TogetherJoinInfo? = decodeWithDiagnostics(raw).getOrNull()
 
-        val asUri = runCatching { URI(trimmed) }.getOrNull()
-        if (asUri != null) {
-            decodeDeepLink(asUri)?.let { return it }
-            decodeWsUrl(asUri)?.let { return it }
+    fun decodeWithDiagnostics(raw: String): Result<TogetherJoinInfo> {
+        val trimmed = raw.trim()
+        if (trimmed.isBlank()) {
+            return Result.failure(IllegalArgumentException("Invitation link is empty"))
         }
 
-        decodeCompact(trimmed)?.let { return it }
-        return null
+        // 1. Check for embedded or direct deep link
+        val deepLinkMatch = DEEP_LINK_REGEX.find(trimmed)?.value ?: if (trimmed.startsWith("velune://", ignoreCase = true)) trimmed else null
+        if (deepLinkMatch != null) {
+            val asUri = runCatching { URI(deepLinkMatch) }.getOrNull()
+            if (asUri != null) {
+                val parsed = decodeDeepLink(asUri)
+                if (parsed != null) return parsed.validate()
+            }
+        }
+
+        // 2. Check for embedded or direct ws / http URL
+        val wsMatch = WS_URL_REGEX.find(trimmed)?.value ?: if (trimmed.startsWith("ws://", ignoreCase = true) || trimmed.startsWith("wss://", ignoreCase = true) || trimmed.startsWith("http://", ignoreCase = true) || trimmed.startsWith("https://", ignoreCase = true)) trimmed else null
+        if (wsMatch != null) {
+            val asUri = runCatching { URI(wsMatch) }.getOrNull()
+            if (asUri != null) {
+                val parsed = decodeWsUrl(asUri)
+                if (parsed != null) return parsed.validate()
+            }
+        }
+
+        // 3. Fallback to compact format (host|port|sid|key)
+        val compact = decodeCompact(trimmed)
+        if (compact != null) {
+            return compact.validate()
+        }
+
+        return Result.failure(IllegalArgumentException("Invalid invitation link format"))
+    }
+
+    fun isValidHostAddress(host: String): Boolean {
+        val trimmed = host.trim().removeSurrounding("[", "]")
+        if (trimmed.isBlank()) return false
+
+        // Disallow URL schemes, slashes, or query fragments in host
+        if (trimmed.contains("/") || trimmed.contains("?") || trimmed.contains("#")) return false
+        if (trimmed.startsWith("http:", ignoreCase = true) || trimmed.startsWith("ws:", ignoreCase = true)) return false
+
+        // Wildcard bind addresses cannot be used as target connect addresses
+        if (trimmed == "0.0.0.0" || trimmed == "::" || trimmed == "0:0:0:0:0:0:0:0") return false
+
+        // Check if valid IPv4
+        if (IPV4_REGEX.matches(trimmed)) return true
+
+        // Check if valid IPv6
+        if (trimmed.contains(":")) {
+            return runCatching {
+                val addr = java.net.Inet6Address.getByName(trimmed)
+                !addr.isAnyLocalAddress
+            }.getOrDefault(false)
+        }
+
+        // Check RFC 1123 Hostname / domain
+        val hostnameRegex = Regex("""^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$""")
+        return hostnameRegex.matches(trimmed)
     }
 
     private fun decodeDeepLink(uri: URI): TogetherJoinInfo? {
@@ -111,8 +192,8 @@ object TogetherLink {
             .mapNotNull { pair ->
                 val idx = pair.indexOf('=')
                 if (idx <= 0) return@mapNotNull null
-                val k = URLDecoder.decode(pair.substring(0, idx), charset)
-                val v = URLDecoder.decode(pair.substring(idx + 1), charset)
+                val k = runCatching { URLDecoder.decode(pair.substring(0, idx), charset) }.getOrNull() ?: return@mapNotNull null
+                val v = runCatching { URLDecoder.decode(pair.substring(idx + 1), charset) }.getOrNull() ?: return@mapNotNull null
                 k to v
             }
             .toMap()

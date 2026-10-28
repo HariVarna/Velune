@@ -19,6 +19,9 @@ import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import io.ktor.websocket.send
+import java.net.BindException
+import java.net.InetAddress
+import java.net.ServerSocket
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
@@ -67,6 +70,9 @@ class TogetherServer(
     @Volatile
     private var lastParticipants: List<TogetherParticipant> = emptyList()
 
+    val isRunning: Boolean
+        get() = engine != null
+
     private data class Client(
         val participantId: String,
         val clientId: String,
@@ -84,17 +90,40 @@ class TogetherServer(
     suspend fun currentSettings(): TogetherRoomSettings = mutex.withLock { settings }
 
     suspend fun start(port: Int) {
+        if (port !in 1..65535) {
+            throw IllegalArgumentException("Invalid port: $port. Port must be between 1 and 65535.")
+        }
+
         mutex.withLock {
-            if (engine != null) return
-            engine =
-                embeddedServer(CIO, port = port, host = "0.0.0.0") {
-                    install(WebSockets)
-                    routing {
-                        webSocket("/together") {
-                            handleClient()
+            if (engine != null) {
+                throw IllegalStateException("Together server is already running")
+            }
+
+            // Proactively detect port conflict / socket binding failures before launching Ktor
+            try {
+                ServerSocket(port, 1, InetAddress.getByName("0.0.0.0")).use { socket ->
+                    socket.reuseAddress = true
+                }
+            } catch (e: BindException) {
+                throw BindException("Port $port is already in use")
+            }
+
+            try {
+                val newEngine =
+                    embeddedServer(CIO, port = port, host = "0.0.0.0") {
+                        install(WebSockets)
+                        routing {
+                            webSocket("/together") {
+                                handleClient()
+                            }
                         }
                     }
-                }.also { it.start(wait = false) }
+                newEngine.start(wait = false)
+                engine = newEngine
+            } catch (t: Throwable) {
+                engine = null
+                throw t
+            }
         }
     }
 
@@ -111,7 +140,7 @@ class TogetherServer(
         }
         clients.clear()
 
-        runCatching { eng.stop(1000, 2000) }
+        runCatching { eng.stop(500, 1500) }
     }
 
     suspend fun updateSettings(newSettings: TogetherRoomSettings) {
@@ -148,6 +177,7 @@ class TogetherServer(
                 ),
             )
         }
+
         onEvent?.invoke(
             TogetherServerEvent.ParticipantJoined(
                 TogetherParticipant(
@@ -159,6 +189,21 @@ class TogetherServer(
                 ),
             ),
         )
+    }
+
+    suspend fun kickParticipant(participantId: String, reason: String? = null) {
+        val client = clients.remove(participantId) ?: return
+        val normalReason = reason?.trim().takeIf { !it.isNullOrBlank() } ?: "Kicked by host"
+        runCatching {
+            client.session.send(
+                TogetherJson.json.encodeToString(
+                    TogetherMessage.serializer(),
+                    KickParticipant(sessionId = sessionId, participantId = participantId, reason = normalReason),
+                ),
+            )
+            client.session.close(CloseReason(CloseReason.Codes.NORMAL, normalReason))
+        }
+        onEvent?.invoke(TogetherServerEvent.ParticipantLeft(participantId, normalReason))
     }
 
     suspend fun broadcastRoomState(state: TogetherRoomState) {
@@ -315,29 +360,39 @@ class TogetherServer(
 
                 when (message) {
                     is HeartbeatPing -> {
-                        send(
-                            TogetherJson.json.encodeToString(
-                                TogetherMessage.serializer(),
-                                HeartbeatPong(
-                                    sessionId = sessionId,
-                                    pingId = message.pingId,
-                                    clientElapsedRealtimeMs = message.clientElapsedRealtimeMs,
-                                    serverElapsedRealtimeMs = android.os.SystemClock.elapsedRealtime(),
+                        if (message.sessionId == sessionId) {
+                            send(
+                                TogetherJson.json.encodeToString(
+                                    TogetherMessage.serializer(),
+                                    HeartbeatPong(
+                                        sessionId = sessionId,
+                                        pingId = message.pingId,
+                                        clientElapsedRealtimeMs = message.clientElapsedRealtimeMs,
+                                        serverElapsedRealtimeMs = android.os.SystemClock.elapsedRealtime(),
+                                    ),
                                 ),
-                            ),
-                        )
+                            )
+                        }
                     }
 
                     is ControlRequest -> {
-                        if (!client.pending) onEvent?.invoke(TogetherServerEvent.ControlRequested(message))
+                        // Validate session and force participantId to match the server-assigned client id
+                        if (message.sessionId == sessionId && !client.pending) {
+                            val validatedRequest = message.copy(participantId = client.participantId)
+                            onEvent?.invoke(TogetherServerEvent.ControlRequested(validatedRequest))
+                        }
                     }
 
                     is AddTrackRequest -> {
-                        if (!client.pending) onEvent?.invoke(TogetherServerEvent.AddTrackRequested(message))
+                        // Validate session and force participantId to match the server-assigned client id
+                        if (message.sessionId == sessionId && !client.pending) {
+                            val validatedRequest = message.copy(participantId = client.participantId)
+                            onEvent?.invoke(TogetherServerEvent.AddTrackRequested(validatedRequest))
+                        }
                     }
 
                     is ClientLeave -> {
-                        if (message.participantId == participantId) {
+                        if (message.sessionId == sessionId && message.participantId == participantId) {
                             close(CloseReason(CloseReason.Codes.NORMAL, "Left"))
                             break
                         }

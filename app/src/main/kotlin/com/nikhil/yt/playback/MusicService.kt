@@ -1996,24 +1996,77 @@ class MusicService :
         settings: com.nikhil.yt.together.TogetherRoomSettings,
     ) {
         ensureScopesActive()
+        val current = togetherSessionState.value
+        if (current is com.nikhil.yt.together.TogetherSessionState.Hosting && current.roomState == null) {
+            timber.log.Timber.tag("Together").w("LAN Host session creation already in progress")
+            return
+        }
+
+        // Show loading state immediately to prevent duplicate UI clicks
         scope.launch(SilentHandler) {
-            togetherSessionState.value = com.nikhil.yt.together.TogetherSessionState.Idle
+            togetherSessionState.value =
+                com.nikhil.yt.together.TogetherSessionState.Hosting(
+                    sessionId = "",
+                    joinLink = "...",
+                    localAddressHint = null,
+                    port = port,
+                    settings = settings,
+                    roomState = null,
+                )
         }
 
         ioScope.launch(SilentHandler) {
             stopTogetherInternal()
             togetherIsOnlineSession = false
 
+            if (port !in 1024..65535) {
+                scope.launch(SilentHandler) {
+                    togetherSessionState.value =
+                        com.nikhil.yt.together.TogetherSessionState.Error(
+                            message = "Invalid port ($port). Port must be between 1024 and 65535.",
+                            recoverable = true,
+                        )
+                }
+                return@launch
+            }
+
             val localIp = getLocalIpv4Address()
+            if (localIp == null) {
+                scope.launch(SilentHandler) {
+                    togetherSessionState.value =
+                        com.nikhil.yt.together.TogetherSessionState.Error(
+                            message = "Cannot host LAN session: No active Wi-Fi or local hotspot network found. Ensure device is connected to Wi-Fi or has portable hotspot enabled.",
+                            recoverable = true,
+                        )
+                }
+                stopTogetherInternal()
+                return@launch
+            }
+
             val sessionId = java.util.UUID.randomUUID().toString()
             val sessionKey = java.util.UUID.randomUUID().toString()
             val joinInfo =
                 com.nikhil.yt.together.TogetherJoinInfo(
-                    host = localIp ?: "127.0.0.1",
+                    host = localIp,
                     port = port,
                     sessionId = sessionId,
                     sessionKey = sessionKey,
                 )
+
+            val validation = joinInfo.validate()
+            if (validation.isFailure) {
+                val errMsg = validation.exceptionOrNull()?.message ?: "Invalid invitation data"
+                scope.launch(SilentHandler) {
+                    togetherSessionState.value =
+                        com.nikhil.yt.together.TogetherSessionState.Error(
+                            message = "Failed to create LAN invitation: $errMsg",
+                            recoverable = true,
+                        )
+                }
+                stopTogetherInternal()
+                return@launch
+            }
+
             val joinLink = com.nikhil.yt.together.TogetherLink.encode(joinInfo)
 
             val server =
@@ -2027,9 +2080,34 @@ class MusicService :
 
             server.onEvent = startTogetherHostEventLoop { server.currentSettings() }
 
-            server.start(port)
+            try {
+                server.start(port)
+            } catch (e: java.net.BindException) {
+                scope.launch(SilentHandler) {
+                    togetherSessionState.value =
+                        com.nikhil.yt.together.TogetherSessionState.Error(
+                            message = "Port $port is already in use by another service. Please select a different port in settings.",
+                            recoverable = true,
+                        )
+                }
+                stopTogetherInternal()
+                return@launch
+            } catch (t: Throwable) {
+                val msg = t.localizedMessage?.takeIf { it.isNotBlank() } ?: "Socket binding failed"
+                scope.launch(SilentHandler) {
+                    togetherSessionState.value =
+                        com.nikhil.yt.together.TogetherSessionState.Error(
+                            message = "Failed to start local server on port $port: $msg",
+                            recoverable = true,
+                        )
+                }
+                stopTogetherInternal()
+                return@launch
+            }
+
             togetherServer = server
 
+            // Only report successful room creation after the server is ready
             scope.launch(SilentHandler) {
                 togetherSessionState.value =
                     com.nikhil.yt.together.TogetherSessionState.Hosting(
@@ -2281,15 +2359,23 @@ class MusicService :
         displayName: String,
     ) {
         ensureScopesActive()
-        val joinInfo = com.nikhil.yt.together.TogetherLink.decode(rawLink)
+        val decodedResult = com.nikhil.yt.together.TogetherLink.decodeWithDiagnostics(rawLink)
+        val joinInfo = decodedResult.getOrNull()
         if (joinInfo == null) {
+            val failureReason = decodedResult.exceptionOrNull()?.message ?: getString(R.string.invalid_link)
             scope.launch(SilentHandler) {
                 togetherSessionState.value =
                     com.nikhil.yt.together.TogetherSessionState.Error(
-                        message = getString(R.string.invalid_link),
+                        message = failureReason,
                         recoverable = true,
                     )
             }
+            return
+        }
+
+        val current = togetherSessionState.value
+        if (current is com.nikhil.yt.together.TogetherSessionState.Joining && current.joinLink == joinInfo.toDeepLink()) {
+            timber.log.Timber.tag("Together").w("Join attempt already in progress for this link")
             return
         }
 
@@ -2750,9 +2836,12 @@ class MusicService :
     }
 
     fun kickTogetherParticipant(participantId: String, reason: String? = null) {
-        val onlineHost = togetherOnlineHost ?: return
+        val server = togetherServer
+        val onlineHost = togetherOnlineHost
+        if (server == null && onlineHost == null) return
         ioScope.launch(SilentHandler) {
-            onlineHost.kickParticipant(participantId, reason)
+            server?.kickParticipant(participantId, reason)
+            onlineHost?.kickParticipant(participantId, reason)
         }
     }
 
@@ -3170,13 +3259,53 @@ class MusicService :
 
     private fun getLocalIpv4Address(): String? {
         return runCatching {
-            java.net.NetworkInterface.getNetworkInterfaces().toList()
-                .asSequence()
-                .filter { it.isUp && !it.isLoopback }
-                .flatMap { it.inetAddresses.toList().asSequence() }
-                .filterIsInstance<java.net.Inet4Address>()
-                .map { it.hostAddress }
-                .firstOrNull { it.isNotBlank() && it != "127.0.0.1" }
+            val interfaces =
+                java.net.NetworkInterface.getNetworkInterfaces().toList()
+                    .filter { it.isUp && !it.isLoopback }
+
+            // Priority:
+            // 1. Wi-Fi (wlan, swlan, wifi)
+            // 2. Hotspot / SoftAP / Wi-Fi Direct (ap, softap, p2p)
+            // 3. Ethernet (eth, en)
+            // 4. Other physical/virtual interfaces (deprioritizing cellular and VPN)
+            val priorityPatterns = listOf(
+                Regex("""^(wlan|swlan|wifi).*""", RegexOption.IGNORE_CASE),
+                Regex("""^(ap|softap|p2p).*""", RegexOption.IGNORE_CASE),
+                Regex("""^(eth|en).*""", RegexOption.IGNORE_CASE),
+            )
+
+            fun interfaceRank(name: String): Int {
+                priorityPatterns.forEachIndexed { index, pattern ->
+                    if (pattern.matches(name)) return index
+                }
+                // Exclude cellular carrier data and VPN interfaces from LAN host discovery
+                if (name.startsWith("tun", ignoreCase = true) ||
+                    name.startsWith("tap", ignoreCase = true) ||
+                    name.startsWith("dummy", ignoreCase = true) ||
+                    name.startsWith("rmnet", ignoreCase = true) ||
+                    name.startsWith("ccmni", ignoreCase = true) ||
+                    name.startsWith("pdp", ignoreCase = true)
+                ) {
+                    return 999
+                }
+                return 10
+            }
+
+            val candidateInterfaces = interfaces
+                .filter { interfaceRank(it.name) < 999 }
+                .sortedBy { interfaceRank(it.name) }
+
+            for (iface in candidateInterfaces) {
+                val addr =
+                    iface.inetAddresses.toList()
+                        .asSequence()
+                        .filterIsInstance<java.net.Inet4Address>()
+                        .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress && !it.isAnyLocalAddress }
+                        .map { it.hostAddress }
+                        .firstOrNull { it != null && it.isNotBlank() && it != "127.0.0.1" && it != "0.0.0.0" }
+                if (addr != null) return@runCatching addr
+            }
+            null
         }.getOrNull()
     }
 
