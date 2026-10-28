@@ -237,4 +237,213 @@ class TogetherLanTest {
         val ssl = SSLHandshakeException("Certificate failure")
         assertTrue(client.connectionFailureMessage(ssl).contains("Secure connection failed"))
     }
+
+    @Test
+    fun togetherParticipant_hostApprovalFlow() = runBlocking {
+        val port = ServerSocket(0).use { it.localPort }
+        val scope = CoroutineScope(Dispatchers.Default)
+        val server = TogetherServer(
+            scope = scope,
+            sessionId = "sess-apprv",
+            sessionKey = "key-apprv",
+            hostDisplayName = "Host",
+            initialSettings = TogetherRoomSettings(
+                allowGuestsToAddTracks = true,
+                allowGuestsToControlPlayback = true,
+                requireHostApprovalToJoin = true,
+            ),
+        )
+        server.start(port)
+
+        val joinInfo = TogetherJoinInfo(
+            host = "127.0.0.1",
+            port = port,
+            sessionId = "sess-apprv",
+            sessionKey = "key-apprv",
+        )
+        val guestClientId = "guest-client-1"
+        val client = TogetherClient(scope, clientId = guestClientId)
+
+        try {
+            client.connect(joinInfo, "GuestUser")
+
+            // Wait for Welcome event on guest
+            val welcomeEvent = kotlinx.coroutines.withTimeoutOrNull(5000) {
+                kotlinx.coroutines.flow.first(client.events) { it is TogetherClientEvent.Welcome } as TogetherClientEvent.Welcome
+            }
+            assertNotNull("Welcome event should be received", welcomeEvent)
+            assertTrue("Guest must be marked pending on welcome when approval enabled", welcomeEvent!!.welcome.isPending)
+
+            // Verify server participant list shows guest as pending
+            val pendingParticipants = server.currentParticipants()
+            val guestParticipant = pendingParticipants.firstOrNull { it.name == "GuestUser" }
+            assertNotNull(guestParticipant)
+            assertTrue(guestParticipant!!.isPending)
+
+            // Broadcast room state with tracks while guest is pending
+            val testTrack = TogetherTrack(id = "track-1", title = "Test Song")
+            server.broadcastRoomState(
+                TogetherRoomState(
+                    sessionId = "sess-apprv",
+                    hostId = "host-id",
+                    queue = listOf(testTrack),
+                    isPlaying = true,
+                ),
+            )
+
+            // Pending guest should receive sanitized state (empty queue)
+            val stateBeforeApproval = kotlinx.coroutines.withTimeoutOrNull(3000) {
+                kotlinx.coroutines.flow.first(client.events) { it is TogetherClientEvent.RoomState } as TogetherClientEvent.RoomState
+            }
+            assertNotNull(stateBeforeApproval)
+            assertTrue("Pending guest must not receive queue items", stateBeforeApproval!!.state.queue.isEmpty())
+            assertFalse("Pending guest must have isPlaying false", stateBeforeApproval.state.isPlaying)
+
+            // Host approves participant
+            server.approveParticipant(guestParticipant.id, true)
+
+            // Guest receives JoinDecision with approved = true
+            val decisionEvent = kotlinx.coroutines.withTimeoutOrNull(3000) {
+                kotlinx.coroutines.flow.first(client.events) { it is TogetherClientEvent.JoinDecision } as TogetherClientEvent.JoinDecision
+            }
+            assertNotNull(decisionEvent)
+            assertTrue(decisionEvent!!.decision.approved)
+
+            // Server participant list now shows approved guest
+            val updatedParticipants = server.currentParticipants()
+            val approvedGuest = updatedParticipants.firstOrNull { it.id == guestParticipant.id }
+            assertNotNull(approvedGuest)
+            assertFalse(approvedGuest!!.isPending)
+
+            // Broadcast state again; approved guest receives actual queue
+            server.broadcastRoomState(
+                TogetherRoomState(
+                    sessionId = "sess-apprv",
+                    hostId = "host-id",
+                    queue = listOf(testTrack),
+                    isPlaying = true,
+                ),
+            )
+            val stateAfterApproval = kotlinx.coroutines.withTimeoutOrNull(3000) {
+                kotlinx.coroutines.flow.first(client.events) {
+                    it is TogetherClientEvent.RoomState && it.state.queue.isNotEmpty()
+                } as TogetherClientEvent.RoomState
+            }
+            assertNotNull(stateAfterApproval)
+            assertEquals("track-1", stateAfterApproval!!.state.queue.first().id)
+        } finally {
+            client.disconnect()
+            server.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun togetherParticipant_hostRejectionFlow() = runBlocking {
+        val port = ServerSocket(0).use { it.localPort }
+        val scope = CoroutineScope(Dispatchers.Default)
+        val server = TogetherServer(
+            scope = scope,
+            sessionId = "sess-rej",
+            sessionKey = "key-rej",
+            hostDisplayName = "Host",
+            initialSettings = TogetherRoomSettings(requireHostApprovalToJoin = true),
+        )
+        server.start(port)
+
+        val joinInfo = TogetherJoinInfo(
+            host = "127.0.0.1",
+            port = port,
+            sessionId = "sess-rej",
+            sessionKey = "key-rej",
+        )
+        val client = TogetherClient(scope, clientId = "guest-client-rej")
+
+        try {
+            client.connect(joinInfo, "RejectedGuest")
+            val welcomeEvent = kotlinx.coroutines.withTimeoutOrNull(5000) {
+                kotlinx.coroutines.flow.first(client.events) { it is TogetherClientEvent.Welcome } as TogetherClientEvent.Welcome
+            }
+            assertNotNull(welcomeEvent)
+
+            // Host rejects participant
+            server.approveParticipant(welcomeEvent!!.welcome.participantId, false)
+
+            val decision = kotlinx.coroutines.withTimeoutOrNull(3000) {
+                kotlinx.coroutines.flow.first(client.events) { it is TogetherClientEvent.JoinDecision } as TogetherClientEvent.JoinDecision
+            }
+            assertNotNull(decision)
+            assertFalse(decision!!.decision.approved)
+
+            // Participant removed from server
+            val participants = server.currentParticipants()
+            assertNull(participants.firstOrNull { it.id == welcomeEvent.welcome.participantId })
+        } finally {
+            client.disconnect()
+            server.stop()
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun togetherParticipant_kickAndBanFlow() = runBlocking {
+        val port = ServerSocket(0).use { it.localPort }
+        val scope = CoroutineScope(Dispatchers.Default)
+        val server = TogetherServer(
+            scope = scope,
+            sessionId = "sess-kb",
+            sessionKey = "key-kb",
+            hostDisplayName = "Host",
+            initialSettings = TogetherRoomSettings(requireHostApprovalToJoin = false),
+        )
+        server.start(port)
+
+        val joinInfo = TogetherJoinInfo(
+            host = "127.0.0.1",
+            port = port,
+            sessionId = "sess-kb",
+            sessionKey = "key-kb",
+        )
+        val bannedClientId = "troublemaker-123"
+        val client = TogetherClient(scope, clientId = bannedClientId)
+
+        try {
+            client.connect(joinInfo, "BadActor")
+            val welcomeEvent = kotlinx.coroutines.withTimeoutOrNull(5000) {
+                kotlinx.coroutines.flow.first(client.events) { it is TogetherClientEvent.Welcome } as TogetherClientEvent.Welcome
+            }
+            assertNotNull(welcomeEvent)
+            val pid = welcomeEvent!!.welcome.participantId
+
+            // Host bans participant
+            server.banParticipant(pid, "Spamming")
+
+            // Wait for disconnected event on client
+            val disconnect = kotlinx.coroutines.withTimeoutOrNull(3000) {
+                kotlinx.coroutines.flow.first(client.events) { it is TogetherClientEvent.Disconnected }
+            }
+            assertNotNull(disconnect)
+
+            // Server participants list must not have bad actor
+            assertNull(server.currentParticipants().firstOrNull { it.id == pid })
+
+            // Attempt to connect again with same banned client ID
+            val client2 = TogetherClient(scope, clientId = bannedClientId)
+            client2.connect(joinInfo, "BadActor")
+
+            val issueOrDisconnect = kotlinx.coroutines.withTimeoutOrNull(5000) {
+                kotlinx.coroutines.flow.first(client2.events) {
+                    it is TogetherClientEvent.Error || it is TogetherClientEvent.Disconnected
+                }
+            }
+            assertNotNull(issueOrDisconnect)
+            // Still not in participants list
+            assertEquals(1, server.currentParticipants().size) // Only host
+            client2.disconnect()
+        } finally {
+            client.disconnect()
+            server.stop()
+            scope.cancel()
+        }
+    }
 }

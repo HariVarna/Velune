@@ -745,7 +745,9 @@ Velune will only extract your token, and everything else is stored locally.</str
     <string name="together_hosting">Hosting session</string>
     <string name="together_joining">Joining session</string>
     <string name="together_connected">Connected</string>
+    <string name="together_disconnected">Disconnected</string>
     <string name="together_error_state">Error</string>
+    <string name="together_end_session">End session</string>
 
     <string name="got_it">Got it</string>
     <string name="together_dont_show_again">Don\'t show this again</string>

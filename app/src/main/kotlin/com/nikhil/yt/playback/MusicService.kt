@@ -2457,6 +2457,18 @@ class MusicService :
                                         )
                                 }
                                 ioScope.launch(SilentHandler) { stopTogetherInternal() }
+                            } else {
+                                scope.launch(SilentHandler) {
+                                    val joined = togetherSessionState.value as? com.nikhil.yt.together.TogetherSessionState.Joined
+                                    if (joined != null) {
+                                        val updatedParticipants = joined.roomState.participants.map { p ->
+                                            if (p.id == joined.selfParticipantId) p.copy(isPending = false) else p
+                                        }
+                                        togetherSessionState.value = joined.copy(
+                                            roomState = joined.roomState.copy(participants = updatedParticipants),
+                                        )
+                                    }
+                                }
                             }
                         }
 
@@ -2699,6 +2711,18 @@ class MusicService :
                                             )
                                     }
                                     ioScope.launch(SilentHandler) { stopTogetherInternal() }
+                                } else {
+                                    scope.launch(SilentHandler) {
+                                        val joined = togetherSessionState.value as? com.nikhil.yt.together.TogetherSessionState.Joined
+                                        if (joined != null) {
+                                            val updatedParticipants = joined.roomState.participants.map { p ->
+                                                if (p.id == joined.selfParticipantId) p.copy(isPending = false) else p
+                                            }
+                                            togetherSessionState.value = joined.copy(
+                                                roomState = joined.roomState.copy(participants = updatedParticipants),
+                                            )
+                                        }
+                                    }
                                 }
                             }
 
@@ -2822,6 +2846,7 @@ class MusicService :
         ioScope.launch(SilentHandler) {
             server?.updateSettings(settings)
             onlineHost?.updateSettings(settings)
+            broadcastHostStateNow()
         }
     }
 
@@ -2832,6 +2857,7 @@ class MusicService :
         ioScope.launch(SilentHandler) {
             server?.approveParticipant(participantId, approved)
             onlineHost?.approveParticipant(participantId, approved)
+            broadcastHostStateNow()
         }
     }
 
@@ -2842,13 +2868,60 @@ class MusicService :
         ioScope.launch(SilentHandler) {
             server?.kickParticipant(participantId, reason)
             onlineHost?.kickParticipant(participantId, reason)
+            broadcastHostStateNow()
         }
     }
 
     fun banTogetherParticipant(participantId: String, reason: String? = null) {
-        val onlineHost = togetherOnlineHost ?: return
+        val server = togetherServer
+        val onlineHost = togetherOnlineHost
+        if (server == null && onlineHost == null) return
         ioScope.launch(SilentHandler) {
-            onlineHost.banParticipant(participantId, reason)
+            server?.banParticipant(participantId, reason)
+            onlineHost?.banParticipant(participantId, reason)
+            broadcastHostStateNow()
+        }
+    }
+
+    private suspend fun broadcastHostStateNow() {
+        val server = togetherServer
+        if (server != null) {
+            val state = buildTogetherRoomState(sessionId = server.sessionId, hostId = togetherHostId)
+            server.broadcastRoomState(state)
+            val currentSettings = server.currentSettings()
+            val participants = server.currentParticipants()
+            scope.launch(SilentHandler) {
+                val hosting = togetherSessionState.value as? com.nikhil.yt.together.TogetherSessionState.Hosting
+                if (hosting?.sessionId == server.sessionId) {
+                    togetherSessionState.value = hosting.copy(
+                        settings = currentSettings,
+                        roomState = state.copy(
+                            participants = participants,
+                            settings = currentSettings,
+                        ),
+                    )
+                }
+            }
+            return
+        }
+        val onlineHost = togetherOnlineHost
+        if (onlineHost != null && onlineHost.isConnected) {
+            val state = buildTogetherRoomState(sessionId = onlineHost.sessionId, hostId = togetherHostId)
+            onlineHost.broadcastRoomState(state)
+            val currentSettings = onlineHost.currentSettings()
+            val participants = onlineHost.currentParticipants()
+            scope.launch(SilentHandler) {
+                val hosting = togetherSessionState.value as? com.nikhil.yt.together.TogetherSessionState.HostingOnline
+                if (hosting?.sessionId == onlineHost.sessionId) {
+                    togetherSessionState.value = hosting.copy(
+                        settings = currentSettings,
+                        roomState = state.copy(
+                            participants = participants,
+                            settings = currentSettings,
+                        ),
+                    )
+                }
+            }
         }
     }
 
@@ -2922,6 +2995,12 @@ class MusicService :
                 val settings = currentSettings()
                 if (!settings.allowGuestsToAddTracks) return
                 applyHostAddTrack(event.request.track, event.request.mode)
+            }
+
+            is com.nikhil.yt.together.TogetherServerEvent.JoinRequested,
+            is com.nikhil.yt.together.TogetherServerEvent.ParticipantJoined,
+            is com.nikhil.yt.together.TogetherServerEvent.ParticipantLeft -> {
+                broadcastHostStateNow()
             }
 
             is com.nikhil.yt.together.TogetherServerEvent.Error -> {

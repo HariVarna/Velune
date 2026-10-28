@@ -183,12 +183,29 @@ fun MusicTogetherScreen(
     var showPortDialog by rememberSaveable { mutableStateOf(false) }
     var showJoinDialog by rememberSaveable { mutableStateOf(false) }
 
-    val hostingOnline = sessionState as? TogetherSessionState.HostingOnline
-    val onlineParticipants = hostingOnline?.roomState?.participants.orEmpty()
+    val activeParticipants = when (val state = sessionState) {
+        is TogetherSessionState.Hosting -> state.roomState?.participants.orEmpty()
+        is TogetherSessionState.HostingOnline -> state.roomState?.participants.orEmpty()
+        is TogetherSessionState.Joined -> if (isJoinedAsAcceptedGuest) state.roomState.participants else emptyList()
+        else -> emptyList()
+    }
+    val hostApprovalEnabled = when (val state = sessionState) {
+        is TogetherSessionState.Hosting -> state.settings.requireHostApprovalToJoin
+        is TogetherSessionState.HostingOnline -> state.settings.requireHostApprovalToJoin
+        is TogetherSessionState.Joined -> state.roomState.settings.requireHostApprovalToJoin
+        else -> false
+    }
     var confirmKickParticipantId by rememberSaveable { mutableStateOf<String?>(null) }
     var confirmBanParticipantId by rememberSaveable { mutableStateOf<String?>(null) }
-    val confirmKickName = onlineParticipants.firstOrNull { it.id == confirmKickParticipantId }?.name
-    val confirmBanName = onlineParticipants.firstOrNull { it.id == confirmBanParticipantId }?.name
+    val confirmKickName = activeParticipants.firstOrNull { it.id == confirmKickParticipantId }?.name
+    val confirmBanName = activeParticipants.firstOrNull { it.id == confirmBanParticipantId }?.name
+
+    LaunchedEffect(sessionState) {
+        if (sessionState is TogetherSessionState.Idle || sessionState is TogetherSessionState.Error) {
+            confirmKickParticipantId = null
+            confirmBanParticipantId = null
+        }
+    }
 
     LaunchedEffect(disableJoinUi, isJoining, isHosting) {
         if (disableJoinUi || isJoining || isHosting) showJoinDialog = false
@@ -387,10 +404,11 @@ fun MusicTogetherScreen(
                 .padding(top = 4.dp, bottom = 12.dp),
         )
 
-        if (hostingOnline?.roomState != null && isHostRole) {
-            OnlineParticipantsCard(
-                participants = hostingOnline.roomState.participants,
-                hostApprovalEnabled = hostingOnline.settings.requireHostApprovalToJoin,
+        if (activeParticipants.isNotEmpty()) {
+            ParticipantsCard(
+                participants = activeParticipants,
+                isHostRole = isHostRole,
+                hostApprovalEnabled = hostApprovalEnabled,
                 onApprove = { participantId, approved ->
                     playerConnection?.service?.approveTogetherParticipant(participantId, approved)
                 },
@@ -488,14 +506,20 @@ fun MusicTogetherScreen(
 }
 
 @Composable
-private fun OnlineParticipantsCard(
+private fun ParticipantsCard(
     participants: List<com.nikhil.yt.together.TogetherParticipant>,
+    isHostRole: Boolean,
     hostApprovalEnabled: Boolean,
     onApprove: (participantId: String, approved: Boolean) -> Unit,
     onKick: (participantId: String) -> Unit,
     onBan: (participantId: String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var pendingParticipantActionId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(participants) {
+        pendingParticipantActionId = null
+    }
+
     Card(
         modifier = modifier
             .fillMaxWidth()
@@ -567,17 +591,26 @@ private fun OnlineParticipantsCard(
                     ) {
                         val accent =
                             if (participant.isHost) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+                        val isConnected = participant.isConnected
+                        val iconRes = when {
+                            !isConnected -> R.drawable.error
+                            participant.isHost -> R.drawable.fire
+                            else -> R.drawable.person
+                        }
                         Box(
                             modifier = Modifier
                                 .size(44.dp)
                                 .clip(RoundedCornerShape(16.dp))
-                                .background(accent.copy(alpha = 0.14f)),
+                                .background(
+                                    if (isConnected) accent.copy(alpha = 0.14f)
+                                    else MaterialTheme.colorScheme.error.copy(alpha = 0.14f),
+                                ),
                             contentAlignment = Alignment.Center,
                         ) {
                             Icon(
-                                painter = painterResource(if (participant.isHost) R.drawable.fire else R.drawable.person),
+                                painter = painterResource(iconRes),
                                 contentDescription = null,
-                                tint = accent,
+                                tint = if (isConnected) accent else MaterialTheme.colorScheme.error,
                                 modifier = Modifier.size(22.dp),
                             )
                         }
@@ -587,6 +620,7 @@ private fun OnlineParticipantsCard(
                                 text = participant.name,
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.SemiBold,
+                                color = if (isConnected) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
@@ -594,28 +628,40 @@ private fun OnlineParticipantsCard(
                                 when {
                                     participant.isHost -> stringResource(R.string.together_role_host)
                                     participant.isPending && hostApprovalEnabled -> stringResource(R.string.together_pending_approval)
+                                    !isConnected -> stringResource(R.string.together_disconnected)
                                     else -> stringResource(R.string.together_role_guest)
                                 }
                             Text(
                                 text = subtitle,
                                 style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                color = if (!isConnected) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
                             )
                         }
 
-                        if (!participant.isHost) {
+                        if (isHostRole && !participant.isHost) {
+                            val isActionPending = pendingParticipantActionId == participant.id
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                                 if (participant.isPending && hostApprovalEnabled) {
                                     AtIconButton(
-                                        onClick = { onApprove(participant.id, true) },
+                                        onClick = {
+                                            if (!isActionPending) {
+                                                pendingParticipantActionId = participant.id
+                                                onApprove(participant.id, true)
+                                            }
+                                        },
                                         onLongClick = {},
                                     ) {
                                         Icon(painterResource(R.drawable.check), null)
                                     }
                                     AtIconButton(
-                                        onClick = { onApprove(participant.id, false) },
+                                        onClick = {
+                                            if (!isActionPending) {
+                                                pendingParticipantActionId = participant.id
+                                                onApprove(participant.id, false)
+                                            }
+                                        },
                                         onLongClick = {},
                                     ) {
                                         Icon(painterResource(R.drawable.close), null)
@@ -1307,18 +1353,24 @@ private fun StatusCard(
                     )
                 }
                 if (isActive) {
+                    val isHostSession = when (state) {
+                        is TogetherSessionState.Hosting,
+                        is TogetherSessionState.HostingOnline -> true
+                        is TogetherSessionState.Joined -> state.role is TogetherRole.Host
+                        else -> false
+                    }
                     FilledTonalButton(
                         onClick = onLeave,
                         shape = RoundedCornerShape(14.dp),
                     ) {
                         Icon(
-                            painter = painterResource(R.drawable.leave),
+                            painter = painterResource(if (isHostSession) R.drawable.close else R.drawable.leave),
                             contentDescription = null,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = stringResource(R.string.leave),
+                            text = stringResource(if (isHostSession) R.string.together_end_session else R.string.leave),
                             fontWeight = FontWeight.SemiBold,
                         )
                     }

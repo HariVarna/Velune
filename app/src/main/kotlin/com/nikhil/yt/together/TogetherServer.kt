@@ -82,6 +82,7 @@ class TogetherServer(
     )
 
     private val clients = ConcurrentHashMap<String, Client>()
+    private val bannedClientIds = ConcurrentHashMap.newKeySet<String>()
 
     var onEvent: ((TogetherServerEvent) -> Unit)? = null
 
@@ -139,6 +140,7 @@ class TogetherServer(
             runCatching { client.session.close(CloseReason(CloseReason.Codes.NORMAL, "Session ended")) }
         }
         clients.clear()
+        bannedClientIds.clear()
 
         runCatching { eng.stop(500, 1500) }
     }
@@ -199,6 +201,24 @@ class TogetherServer(
                 TogetherJson.json.encodeToString(
                     TogetherMessage.serializer(),
                     KickParticipant(sessionId = sessionId, participantId = participantId, reason = normalReason),
+                ),
+            )
+            client.session.close(CloseReason(CloseReason.Codes.NORMAL, normalReason))
+        }
+        onEvent?.invoke(TogetherServerEvent.ParticipantLeft(participantId, normalReason))
+    }
+
+    suspend fun banParticipant(participantId: String, reason: String? = null) {
+        val client = clients.remove(participantId) ?: return
+        if (client.clientId.isNotBlank()) {
+            bannedClientIds.add(client.clientId)
+        }
+        val normalReason = reason?.trim().takeIf { !it.isNullOrBlank() } ?: "Banned by host"
+        runCatching {
+            client.session.send(
+                TogetherJson.json.encodeToString(
+                    TogetherMessage.serializer(),
+                    BanParticipant(sessionId = sessionId, participantId = participantId, reason = normalReason),
                 ),
             )
             client.session.close(CloseReason(CloseReason.Codes.NORMAL, normalReason))
@@ -306,6 +326,17 @@ class TogetherServer(
                 ),
             )
             close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Invalid session"))
+            return
+        }
+
+        if (bannedClientIds.contains(hello.clientId)) {
+            send(
+                TogetherJson.json.encodeToString(
+                    TogetherMessage.serializer(),
+                    ServerError(sessionId = hello.sessionId, message = "You have been banned from this room"),
+                ),
+            )
+            close(CloseReason(CloseReason.Codes.CANNOT_ACCEPT, "Banned"))
             return
         }
 
