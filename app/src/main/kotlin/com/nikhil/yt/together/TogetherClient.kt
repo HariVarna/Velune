@@ -120,8 +120,8 @@ class TogetherClient(
     private var connectJob: Job? = null
     private var loopJob: Job? = null
     private var selfParticipantId: String? = null
-    // One queue + one sender keeps requests in order (e.g. "add track" then "seek to it").
-    private val outgoing = Channel<TogetherMessage>(Channel.UNLIMITED)
+    // Bounded queue (capacity = 128) keeps requests in arrival order while preventing unbounded memory growth.
+    private val outgoing = Channel<TogetherMessage>(128)
     private val clientId = clientId.trim().ifBlank { UUID.randomUUID().toString() }.take(64)
     private val normalizedBearerToken: String? = bearerToken?.trim()?.takeIf { it.isNotBlank() }
 
@@ -141,6 +141,7 @@ class TogetherClient(
         connectJob = scope.launch {
             disconnect()
             _state.value = TogetherClientState.Connecting(joinInfo)
+            Timber.tag("Together").i("Connecting to LAN host ${joinInfo.host}:${joinInfo.port} session=${joinInfo.sessionId.take(8)}")
 
             // LAN connections explicitly use unencrypted ws:// (local TogetherServer is cleartext CIO).
             // Do NOT try wss fallback for LAN hosts, as it would cause misleading SSLHandshakeExceptions or double timeouts.
@@ -166,6 +167,7 @@ class TogetherClient(
                         )
                     send(TogetherJson.json.encodeToString(TogetherMessage.serializer(), hello))
                     _state.value = TogetherClientState.Connected(joinInfo)
+                    Timber.tag("Together").i("Connected to LAN host session=${joinInfo.sessionId.take(8)}")
                     val sender = launch { sendQueued(this@webSocket) }
                     runLoop(this, joinInfo.sessionId)
                     sender.cancel()
@@ -175,6 +177,7 @@ class TogetherClient(
                 lastError = t
             }
 
+            Timber.tag("Together").w("LAN connection failed session=${joinInfo.sessionId.take(8)} error=${lastError?.message}")
             _events.tryEmit(TogetherClientEvent.Error(connectionFailureMessage(lastError), lastError))
             _state.value = TogetherClientState.Idle
         }
@@ -190,6 +193,7 @@ class TogetherClient(
         connectJob = scope.launch {
             disconnect()
             _state.value = TogetherClientState.ConnectingRemote(wsUrl = wsUrl, sessionId = sessionId)
+            Timber.tag("Together").i("Connecting to remote session=${sessionId.take(8)}")
 
             val urls = listOfNotNull(wsUrl.trim(), alternateWebSocketSchemeOrNull(wsUrl.trim())).distinct()
             val token = normalizedBearerToken
@@ -214,6 +218,7 @@ class TogetherClient(
                             )
                         send(TogetherJson.json.encodeToString(TogetherMessage.serializer(), hello))
                         _state.value = TogetherClientState.ConnectedRemote(wsUrl = candidate, sessionId = sessionId)
+                        Timber.tag("Together").i("Connected to remote session=${sessionId.take(8)}")
                         val sender = launch { sendQueued(this@webSocket) }
                         runLoop(this, sessionId)
                         sender.cancel()
@@ -224,6 +229,7 @@ class TogetherClient(
                 }
             }
 
+            Timber.tag("Together").w("Remote connection failed session=${sessionId.take(8)} error=${lastError?.message}")
             _events.tryEmit(TogetherClientEvent.Error(connectionFailureMessage(lastError), lastError))
             _state.value = TogetherClientState.Idle
         }
@@ -289,12 +295,18 @@ class TogetherClient(
 
     fun requestControl(sessionId: String, action: ControlAction) {
         val pid = selfParticipantId ?: return
-        outgoing.trySend(ControlRequest(sessionId = sessionId, participantId = pid, action = action))
+        val res = outgoing.trySend(ControlRequest(sessionId = sessionId, participantId = pid, action = action))
+        if (res.isFailure) {
+            Timber.tag("Together").w("Outgoing queue full, dropped control action: $action")
+        }
     }
 
     fun requestAddTrack(sessionId: String, track: TogetherTrack, mode: AddTrackMode) {
         val pid = selfParticipantId ?: return
-        outgoing.trySend(AddTrackRequest(sessionId = sessionId, participantId = pid, track = track, mode = mode))
+        val res = outgoing.trySend(AddTrackRequest(sessionId = sessionId, participantId = pid, track = track, mode = mode))
+        if (res.isFailure) {
+            Timber.tag("Together").w("Outgoing queue full, dropped add track request: ${track.id}")
+        }
     }
 
     fun sendHeartbeat(sessionId: String, pingId: Long, clientElapsedRealtimeMs: Long) {

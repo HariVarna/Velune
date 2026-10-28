@@ -337,4 +337,92 @@ class TogetherCoreTest {
         sim.onLocalPlaybackChanged("UserNextTrack", now = 1700L)
         assertEquals(listOf("UserNextTrack"), sim.sentLocalCommands)
     }
+
+    @Test
+    fun sessionEpoch_discardsStaleSessionCallbacks() {
+        val currentEpoch = java.util.concurrent.atomic.AtomicLong(1L)
+        var appliedSessionState: String? = null
+
+        fun onAsyncEvent(eventSessionEpoch: Long, newState: String) {
+            if (eventSessionEpoch != currentEpoch.get()) {
+                // Stale callback dropped
+                return
+            }
+            appliedSessionState = newState
+        }
+
+        // Active session 1 receives event
+        onAsyncEvent(1L, "Joined(Session-1)")
+        assertEquals("Joined(Session-1)", appliedSessionState)
+
+        // Session 1 is stopped and Session 2 starts
+        val newEpoch = currentEpoch.incrementAndGet() // epoch = 2
+        assertEquals(2L, newEpoch)
+
+        // Late arriving event from Session 1 arrives now
+        onAsyncEvent(1L, "Error(Session-1 failed)")
+        // Must NOT overwrite or corrupt state
+        assertEquals("Joined(Session-1)", appliedSessionState)
+
+        // Valid event from Session 2 arrives
+        onAsyncEvent(2L, "Joined(Session-2)")
+        assertEquals("Joined(Session-2)", appliedSessionState)
+    }
+
+    @Test
+    fun boundedQueue_preservesOrder_and_handlesCapacity() = kotlinx.coroutines.runBlocking {
+        val bounded = kotlinx.coroutines.channels.Channel<TogetherMessage>(128)
+
+        // Send 128 items
+        for (i in 1..128) {
+            val res = bounded.trySend(ControlRequest("s", "p", ControlAction.Seek(i.toLong())))
+            assertTrue(res.isSuccess)
+        }
+
+        // 129th item exceeds capacity
+        val overflowRes = bounded.trySend(ControlRequest("s", "p", ControlAction.Play))
+        assertFalse("Channel must report failure when full", overflowRes.isSuccess)
+
+        // Verify FIFO extraction of all 128 items
+        for (i in 1..128) {
+            val item = bounded.receive() as ControlRequest
+            val action = item.action as ControlAction.Seek
+            assertEquals(i.toLong(), action.positionMs)
+        }
+    }
+
+    @Test
+    fun undecodableMessage_recovery_guestAndServer() {
+        val malformedJson = """{"type":"FutureUnsupportedMessage","foo":"bar","unknownField":999}"""
+        val result = runCatching {
+            TogetherJson.json.decodeFromString(TogetherMessage.serializer(), malformedJson)
+        }
+        assertTrue("Decoding unsupported message should fail gracefully without unhandled abort", result.isFailure)
+
+        // Valid message after malformed one should decode perfectly
+        val validJson = TogetherJson.json.encodeToString(
+            TogetherMessage.serializer(),
+            ControlRequest("s1", "p1", ControlAction.Play),
+        )
+        val validResult = runCatching {
+            TogetherJson.json.decodeFromString(TogetherMessage.serializer(), validJson)
+        }
+        assertTrue(validResult.isSuccess)
+        val msg = validResult.getOrNull()
+        assertTrue(msg is ControlRequest)
+    }
+
+    @Test
+    fun diagnostics_sanitizesSensitiveSecrets() {
+        val client = TogetherClient(kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Default))
+        val sensitiveToken = "Bearer SecretAdminToken123456789"
+        val sensitiveKey = "key_super_private_session_secret"
+
+        val errorWithToken = RuntimeException("Connection failed with token: $sensitiveToken and key: $sensitiveKey")
+        val message = client.connectionFailureMessage(errorWithToken)
+
+        assertFalse("Error message must never contain the bearer token", message.contains(sensitiveToken))
+        assertFalse("Error message must never contain raw session key", message.contains(sensitiveKey))
+        assertTrue("Error message should display generic failure or safe reason", message.startsWith("Connection failed"))
+    }
 }

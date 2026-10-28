@@ -77,7 +77,7 @@ class TogetherOnlineHost(
     private var session: WebSocketSession? = null
     private var loopJob: Job? = null
     private var hostParticipantId: String? = null
-    private val outgoing = Channel<TogetherMessage>(Channel.UNLIMITED)
+    private val outgoing = Channel<TogetherMessage>(128)
 
     private val clientId = clientId.trim().ifBlank { UUID.randomUUID().toString() }.take(64)
     private val normalizedBearerToken: String? = bearerToken?.trim()?.takeIf { it.isNotBlank() }
@@ -104,6 +104,7 @@ class TogetherOnlineHost(
         hostParticipantId = null
         guests.clear()
         lastParticipants = emptyList()
+        Timber.tag("Together").i("Online host connecting session=${sessionId.take(8)}")
 
         val trimmed = wsUrl.trim()
         val urls = listOfNotNull(trimmed, alternateWebSocketSchemeOrNull(trimmed)).distinct()
@@ -133,6 +134,7 @@ class TogetherOnlineHost(
                             displayName = hostDisplayName.trim(),
                         )
                     send(TogetherJson.json.encodeToString(TogetherMessage.serializer(), hello))
+                    Timber.tag("Together").i("Online host connected session=${sessionId.take(8)}")
                     val sender = launch { sendQueued(this@webSocket) }
                     runLoop(this, candidate)
                     sender.cancel()
@@ -143,6 +145,7 @@ class TogetherOnlineHost(
             }
         }
 
+        Timber.tag("Together").w("Online host connection failed session=${sessionId.take(8)} error=${lastError?.message}")
         onEvent?.invoke(TogetherServerEvent.Error(connectionFailureMessage(lastError), lastError))
     }
 
@@ -189,6 +192,7 @@ class TogetherOnlineHost(
         guests.clear()
         lastParticipants = emptyList()
         while (outgoing.tryReceive().isSuccess) Unit
+        Timber.tag("Together").d("Online host disconnected session=${sessionId.take(8)}")
     }
 
     private suspend fun sendQueued(session: WebSocketSession) {

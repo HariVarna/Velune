@@ -28,6 +28,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import timber.log.Timber
 
 sealed interface TogetherServerEvent {
     data class JoinRequested(
@@ -121,6 +122,7 @@ class TogetherServer(
                     }
                 newEngine.start(wait = false)
                 engine = newEngine
+                Timber.tag("Together").i("Starting LAN server on port $port session=${sessionId.take(8)}")
             } catch (t: Throwable) {
                 engine = null
                 throw t
@@ -131,7 +133,7 @@ class TogetherServer(
     suspend fun stop() {
         val eng =
             mutex.withLock {
-                val e = engine ?: return
+                val e = engine
                 engine = null
                 e
             }
@@ -141,8 +143,9 @@ class TogetherServer(
         }
         clients.clear()
         bannedClientIds.clear()
+        Timber.tag("Together").i("Stopping LAN server session=${sessionId.take(8)}")
 
-        runCatching { eng.stop(500, 1500) }
+        eng?.let { runCatching { it.stop(500, 1500) } }
     }
 
     suspend fun updateSettings(newSettings: TogetherRoomSettings) {
